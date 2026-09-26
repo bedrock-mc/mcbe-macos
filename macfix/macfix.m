@@ -35,15 +35,31 @@ static void installNoBeep(void) {
 // current at that moment. On the Mac the devices can connect before the game
 // registers its observers (so the callbacks never run) or before they become
 // current, and input is silently dead for the session: hover still works, but
-// clicks or keys do nothing. Re-run the game's own setup whenever the current
-// device has no handler; handlers that are already installed are left alone.
+// clicks or keys do nothing. The game also only sets up the current mouse, so
+// with a trackpad and an external mouse, clicks from the other one are dead.
+// Re-run the game's own setup for every mouse that has no handler, presenting
+// it as the current one; handlers that are already installed are left alone.
 static __weak id inputHandler;
 static IMP origOnConnectMouse;
 static IMP origOnConnectKeyboard;
+static IMP origCurrentMouse;
+static GCMouse *mouseBeingSetUp;
+
+static GCMouse *currentMouse(id self, SEL _cmd) {
+    return mouseBeingSetUp ?: ((GCMouse * (*)(id, SEL))origCurrentMouse)(self, _cmd);
+}
+
+static BOOL mouseHasHandler(GCMouse *mouse) {
+    return mouse.mouseInput.leftButton.valueChangedHandler != nil;
+}
 
 static BOOL mouseReady(void) {
-    GCMouse *mouse = GCMouse.current;
-    return !mouse || mouse.mouseInput.leftButton.valueChangedHandler != nil;
+    for (GCMouse *mouse in GCMouse.mice) {
+        if (!mouseHasHandler(mouse)) {
+            return NO;
+        }
+    }
+    return YES;
 }
 
 static BOOL keyboardReady(void) {
@@ -68,10 +84,15 @@ static void repairInput(NSString *reason) {
     if (!handler) {
         return;
     }
-    if (!mouseReady()) {
-        NSNotification *note = [NSNotification notificationWithName:GCMouseDidConnectNotification object:GCMouse.current];
+    for (GCMouse *mouse in GCMouse.mice) {
+        if (mouseHasHandler(mouse)) {
+            continue;
+        }
+        NSNotification *note = [NSNotification notificationWithName:GCMouseDidConnectNotification object:mouse];
+        mouseBeingSetUp = origCurrentMouse ? mouse : nil;
         ((void (*)(id, SEL, NSNotification *))origOnConnectMouse)(handler, sel_registerName("onConnectMouse:"), note);
-        NSLog(@"[macfix] repaired mouse (%@): ready=%d", reason, mouseReady());
+        mouseBeingSetUp = nil;
+        NSLog(@"[macfix] repaired mouse '%@' (%@): ready=%d", mouse.vendorName, reason, mouseHasHandler(mouse));
     }
     if (!keyboardReady()) {
         NSNotification *note = [NSNotification notificationWithName:GCKeyboardDidConnectNotification object:GCKeyboard.coalescedKeyboard];
@@ -111,6 +132,7 @@ static void installInputRepair(void) {
         return;
     }
     origAddObserver = hook([NSNotificationCenter class], "addObserver:selector:name:object:", (IMP)addObserver);
+    origCurrentMouse = hook(object_getClass([GCMouse class]), "current", (IMP)currentMouse);
 
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     for (NSString *name in @[GCMouseDidBecomeCurrentNotification, GCMouseDidConnectNotification,

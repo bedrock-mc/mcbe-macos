@@ -11,7 +11,7 @@ Tested with Minecraft 1.26.50 on an M3 Pro, macOS 26.5.
 
 | Problem | Fix |
 | --- | --- |
-| Clicks or keys dead for a whole session (hover still works) | Re-runs the game's mouse and keyboard setup when a startup race skipped it |
+| Clicks or keys dead for a whole session (hover still works) | Re-runs the game's mouse and keyboard setup when a startup race skipped it, and for every connected mouse (e.g. trackpad plus USB mouse), not just the current one |
 | 60 FPS cap on 120 Hz displays | Raises the game's render loop to 120 Hz |
 | Closing the window leaves the game stuck in the background | Exits cleanly after the game has saved (its exit path otherwise deadlocks) |
 | Freezes after the loading screen with a VPN (e.g. WireGuard) connected | Fails the game's per-frame lookup of the bogus host `Error` instantly instead of after macOS's 5 s timeout |
