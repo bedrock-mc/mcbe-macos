@@ -4,6 +4,7 @@
 #
 # usage: scripts/setup.sh <minecraft.ipa>     install, configure and patch
 #        scripts/setup.sh --patch-only         re-patch an installed app
+#        scripts/setup.sh --patch-only --debuggable   same, attachable by Instruments/lldb
 #        scripts/setup.sh --reset-playchain    fix "Couldn't add the Keychain Item" crashes
 set -euo pipefail
 
@@ -137,6 +138,11 @@ patch_app() {
     step "Patching the app"
     local ent="$BUILD/entitlements.plist"
     codesign -d --entitlements - --xml "$APP_DIR" > "$ent" 2>/dev/null
+    # Profiling only: lets xctrace/lldb attach. Plain runs drop it again.
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.security.get-task-allow" "$ent" >/dev/null 2>&1 || true
+    if [ "$DEBUGGABLE" = 1 ]; then
+        /usr/libexec/PlistBuddy -c "Add :com.apple.security.get-task-allow bool true" "$ent"
+    fi
     cp "$BUILD/libmacfix.dylib" "$APP_DIR/Frameworks/libmacfix.dylib"
     python3 "$ROOT/scripts/patch_app.py" "$APP_DIR/minecraftpe"
     # Marks the app as a game so fullscreen gets macOS Game Mode.
@@ -146,8 +152,13 @@ patch_app() {
     codesign -v "$APP_DIR"
 }
 
+DEBUGGABLE=0
+
 main() {
     check_host
+    if [ "${2:-}" = --debuggable ]; then
+        DEBUGGABLE=1
+    fi
     case "${1:-}" in
         --patch-only) patch_app ;;
         --reset-playchain) reset_playchain; exit 0 ;;

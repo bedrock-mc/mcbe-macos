@@ -3,6 +3,7 @@
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
 #import <netdb.h>
+#import <pthread.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
@@ -213,9 +214,43 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
     const void *replacement, *original;
 } interposeGetaddrinfo = {(const void *)fastGetaddrinfo, (const void *)getaddrinfo};
 
+// The game asks for SCHED_OTHER priorities 5-7 (streaming workers 5, main and
+// render threads 7), far below Darwin's 15-47 range, so its hot threads run
+// at background priority and lose the CPU to any normal thread. Keep the
+// game's ordering but move it into the normal band. MACFIX_SCHED=game keeps
+// the game's values, =drop ignores the requests.
+static int schedMode;  // 0 = map, 1 = game, 2 = drop
+
+static int setSchedParam(pthread_t thread, int policy, const struct sched_param *param) {
+    if (schedMode == 1 || !param || policy != SCHED_OTHER || param->sched_priority >= sched_get_priority_min(policy)) {
+        return pthread_setschedparam(thread, policy, param);
+    }
+    char name[64] = "";
+    pthread_getname_np(thread, name, sizeof(name));
+    if (schedMode == 2) {
+        NSLog(@"[macfix] thread %@: ignored priority %d", @(name), param->sched_priority);
+        return 0;
+    }
+    struct sched_param mapped = *param;
+    mapped.sched_priority = MIN(MAX(31 + (param->sched_priority - 5) * 8, sched_get_priority_min(policy)),
+                                sched_get_priority_max(policy));
+    NSLog(@"[macfix] thread %@: priority %d -> %d", @(name), param->sched_priority, mapped.sched_priority);
+    return pthread_setschedparam(thread, policy, &mapped);
+}
+
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+    const void *replacement, *original;
+} interposeSetSchedParam = {(const void *)setSchedParam, (const void *)pthread_setschedparam};
+
+static void installSched(void) {
+    const char *mode = getenv("MACFIX_SCHED");
+    schedMode = !mode ? 0 : !strcmp(mode, "game") ? 1 : !strcmp(mode, "drop") ? 2 : 0;
+}
+
 void agentStart(void);
 
 __attribute__((constructor)) static void init(void) {
+    installSched();
     installFrameRate();
     agentStart();
     installInputRepair();
