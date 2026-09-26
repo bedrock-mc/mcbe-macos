@@ -127,6 +127,27 @@ static void installInputRepair(void) {
     NSLog(@"[macfix] input repair installed");
 }
 
+// The game reads the scroll wheel from the handler's first (x) value, but on
+// the Mac the wheel and trackpad report vertical scrolling in y with x at 0, so
+// scrolling does nothing. Hand the game y as x when x is empty.
+static IMP origSetDpadHandler;
+
+static void setDpadHandler(id self, SEL _cmd, GCControllerDirectionPadValueChangedHandler handler) {
+    if (handler && [self isKindOfClass:objc_lookUpClass("GCDeviceCursor")]) {
+        GCControllerDirectionPadValueChangedHandler game = handler;
+        handler = ^(GCControllerDirectionPad *pad, float x, float y) {
+            game(pad, x != 0 ? x : y, 0);
+        };
+    }
+    ((void (*)(id, SEL, id))origSetDpadHandler)(self, _cmd, handler);
+}
+
+static void installScrollFix(void) {
+    Class cursor = objc_lookUpClass("GCDeviceCursor");
+    origSetDpadHandler = hook(cursor, "setValueChangedHandler:", (IMP)setDpadHandler);
+    NSLog(@"[macfix] %@", origSetDpadHandler ? @"scroll fix installed" : @"GCDeviceCursor -setValueChangedHandler: not found");
+}
+
 // The game renders from its own display link, created in -startAnimation with
 // the legacy setFrameInterval:, which pins it to 60 Hz on ProMotion displays.
 // Set the range after the game has configured the link; other links (PlayTools
@@ -219,6 +240,7 @@ __attribute__((constructor)) static void init(void) {
     installFrameRate();
     agentStart();
     installInputRepair();
+    installScrollFix();
     installCleanExit();
     // AppKit may not be loaded yet when this image initialises.
     if (objc_getClass("NSResponder")) {
