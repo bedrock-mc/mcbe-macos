@@ -179,18 +179,84 @@ static NSDictionary *costStats(unsigned from) {
 }
 
 static unsigned submitsFrom, presentsFrom, drawsFrom, droppedFrom;
+extern atomic_ullong macfixYields;
+static unsigned long long yieldsFrom;
+static double statsFrom;
+
+// CPU time per thread (µs), keyed by thread id, with its pool name ("Streaming Pool(3)" -> "Streaming Pool").
+static NSDictionary<NSNumber *, NSArray *> *threadTimes(void) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    thread_act_array_t list;
+    mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) {
+        return out;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_extended_info_data_t ext;
+        thread_identifier_info_data_t ident;
+        mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT, in = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n) == KERN_SUCCESS &&
+            thread_info(list[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &in) == KERN_SUCCESS) {
+            NSString *name = @(ext.pth_name);
+            NSRange paren = [name rangeOfString:@"("];
+            if (paren.location != NSNotFound) {
+                name = [name substringToIndex:paren.location];
+            }
+            out[@(ident.thread_id)] = @[name.length ? name : @"(unnamed)", @(ext.pth_user_time / 1000), @(ext.pth_system_time / 1000)];
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof(thread_act_t));
+    return out;
+}
+
+static NSDictionary *cpuFrom;
+
+// CPU % (100 = one core) by thread group since the last reset, split into user and system.
+static NSDictionary *cpuStats(double span) {
+    NSDictionary *nowTimes = threadTimes();
+    NSMutableDictionary<NSString *, NSMutableArray *> *groups = [NSMutableDictionary dictionary];
+    double totalUser = 0, totalSys = 0;
+    for (NSNumber *tid in nowTimes) {
+        NSArray *cur = nowTimes[tid], *old = cpuFrom[tid];
+        double user = [cur[1] doubleValue] - [old[1] doubleValue], sys = [cur[2] doubleValue] - [old[2] doubleValue];
+        NSMutableArray *g = groups[cur[0]] ?: (groups[cur[0]] = [@[@0.0, @0.0, @0] mutableCopy]);
+        g[0] = @([g[0] doubleValue] + user);
+        g[1] = @([g[1] doubleValue] + sys);
+        g[2] = @([g[2] intValue] + 1);
+        totalUser += user;
+        totalSys += sys;
+    }
+    double scale = span > 0 ? 100 / (span * 1e6) : 0;
+    NSMutableDictionary *byGroup = [NSMutableDictionary dictionary];
+    for (NSString *name in groups) {
+        NSArray *g = groups[name];
+        double total = ([g[0] doubleValue] + [g[1] doubleValue]) * scale;
+        if (total >= 1) {
+            byGroup[name] = @{@"user": @(round([g[0] doubleValue] * scale)), @"sys": @(round([g[1] doubleValue] * scale)),
+                              @"threads": g[2]};
+        }
+    }
+    return @{@"total": @(round((totalUser + totalSys) * scale)), @"user": @(round(totalUser * scale)),
+             @"sys": @(round(totalSys * scale)), @"groups": byGroup};
+}
 
 // Intervals between submitted and on-screen presents, and main-thread drawFrame cost, since the last reset.
 static NSDictionary *frameStats(NSDictionary *req) {
     NSDictionary *d = @{@"ok": @YES, @"submit_interval_ms": intervalStats(&submits, submitsFrom),
                         @"present_interval_ms": intervalStats(&presents, presentsFrom),
                         @"drawframe_interval_ms": intervalStats(&drawStarts, drawsFrom),
-                        @"drawframe_cost_ms": costStats(drawsFrom), @"dropped": @(atomic_load(&dropped) - droppedFrom)};
+                        @"drawframe_cost_ms": costStats(drawsFrom), @"dropped": @(atomic_load(&dropped) - droppedFrom),
+                        @"cpu_percent": cpuStats(now() - statsFrom),
+                        @"yields_per_s": @(round((atomic_load(&macfixYields) - yieldsFrom) / MAX(now() - statsFrom, 1e-3)))};
     if ([req[@"reset"] boolValue]) {
         submitsFrom = atomic_load(&submits.n);
         presentsFrom = atomic_load(&presents.n);
         drawsFrom = atomic_load(&drawStarts.n);
         droppedFrom = atomic_load(&dropped);
+        yieldsFrom = atomic_load(&macfixYields);
+        cpuFrom = threadTimes();
+        statsFrom = now();
     }
     if (req[@"label"]) {
         NSData *json = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingSortedKeys error:NULL];
@@ -574,8 +640,12 @@ static NSDictionary *handleMouseMove(NSDictionary *req) {
         if (!handler) {
             return @{@"ok": @NO, @"error": input ? @"the game has no mouse-move handler" : @"no mouse connected"};
         }
-        // GameController deltas are y-up; the protocol's are screen-space.
-        handler(input, dx, -dy);
+        // GameController deltas are y-up; the protocol's are screen-space. "split" delivers the
+        // move as several events, like a high-rate mouse between two frames.
+        int split = MAX([req[@"split"] intValue], 1);
+        for (int i = 0; i < split; i++) {
+            handler(input, dx / split, -dy / split);
+        }
         return @{@"ok": @YES};
     });
 }

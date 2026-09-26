@@ -2,8 +2,11 @@
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <netdb.h>
+#import <mach/mach_time.h>
 #import <pthread.h>
+#import <time.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
@@ -156,6 +159,45 @@ static void installFrameRate(void) {
     NSLog(@"[macfix] frame rate hook installed");
 }
 
+// The game's mouse-move handler calls -setNeedsUpdateOfPrefersPointerLocked
+// on every event, and UIKit re-resolves the scene's lock state (building
+// description strings) each time: ~0.1 ms of main-thread time per event,
+// several per frame with a high-rate mouse. Forward only changes, plus a
+// periodic refresh in case UIKit wants one. MACFIX_POINTER_LOCK=every disables.
+static IMP origSetNeedsPointerLock;
+static int lastPointerLock = -1;
+static double lastPointerLockUpdate;
+
+static void setNeedsPointerLock(UIViewController *self, SEL _cmd) {
+    int wanted = self.prefersPointerLocked;
+    double t = CACurrentMediaTime();
+    if (wanted == lastPointerLock && t - lastPointerLockUpdate < 0.5) {
+        return;
+    }
+    lastPointerLock = wanted;
+    lastPointerLockUpdate = t;
+    ((void (*)(id, SEL))origSetNeedsPointerLock)(self, _cmd);
+}
+
+static void installPointerLockThrottle(void) {
+    const char *mode = getenv("MACFIX_POINTER_LOCK");
+    if (mode && !strcmp(mode, "every")) {
+        return;
+    }
+    Class cls = objc_lookUpClass("minecraftpeViewControllerImpl") ?: objc_lookUpClass("minecraftpeViewControllerBase");
+    SEL sel = sel_registerName("setNeedsUpdateOfPrefersPointerLocked");
+    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+    if (!m) {
+        NSLog(@"[macfix] -setNeedsUpdateOfPrefersPointerLocked not found");
+        return;
+    }
+    // Add an override on the game's class so other view controllers keep UIKit's implementation.
+    origSetNeedsPointerLock = method_getImplementation(m);
+    if (!class_addMethod(cls, sel, (IMP)setNeedsPointerLock, method_getTypeEncoding(m))) {
+        origSetNeedsPointerLock = method_setImplementation(m, (IMP)setNeedsPointerLock);
+    }
+}
+
 // UIKit ends the app with exit(), whose static destructors crash under the
 // game's still-running threads and hang in its crash handler, leaving a
 // windowless process that PlayCover can only reactivate. Once UIKit has
@@ -225,16 +267,14 @@ static int setSchedParam(pthread_t thread, int policy, const struct sched_param 
     if (schedMode == 1 || !param || policy != SCHED_OTHER || param->sched_priority >= sched_get_priority_min(policy)) {
         return pthread_setschedparam(thread, policy, param);
     }
-    char name[64] = "";
-    pthread_getname_np(thread, name, sizeof(name));
     if (schedMode == 2) {
-        NSLog(@"[macfix] thread %@: ignored priority %d", @(name), param->sched_priority);
+        NSLog(@"[macfix] ignored thread priority %d", param->sched_priority);
         return 0;
     }
     struct sched_param mapped = *param;
     mapped.sched_priority = MIN(MAX(31 + (param->sched_priority - 5) * 8, sched_get_priority_min(policy)),
                                 sched_get_priority_max(policy));
-    NSLog(@"[macfix] thread %@: priority %d -> %d", @(name), param->sched_priority, mapped.sched_priority);
+    NSLog(@"[macfix] thread priority %d -> %d", param->sched_priority, mapped.sched_priority);
     return pthread_setschedparam(thread, policy, &mapped);
 }
 
@@ -242,9 +282,73 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
     const void *replacement, *original;
 } interposeSetSchedParam = {(const void *)setSchedParam, (const void *)pthread_setschedparam};
 
+// Pool sizes derive from the core count (streaming = n - 5 workers above 8
+// cores). MACFIX_CORES=<n> overrides it for experiments.
+static unsigned coreOverride;
+unsigned libcxxHardwareConcurrency(void) __asm__("__ZNSt3__16thread20hardware_concurrencyEv");
+
+static unsigned hardwareConcurrency(void) {
+    return coreOverride ?: libcxxHardwareConcurrency();
+}
+
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+    const void *replacement, *original;
+} interposeHardwareConcurrency = {(const void *)hardwareConcurrency, (const void *)libcxxHardwareConcurrency};
+
+// The game's pool workers spin on sched_yield for a while after the pool last
+// had work before they block, and with steady chunk work they rarely block:
+// seven streaming workers make ~1.4M yields/s, mostly kernel time. Once a
+// thread is clearly spinning, sleep briefly instead of yielding.
+// MACFIX_YIELD=spin keeps the game's behaviour, =all backs off every thread
+// (default: streaming workers only); MACFIX_YIELD_SLEEP_US sets the sleep.
+atomic_ullong macfixYields;  // read by the agent's frame_stats
+static int yieldMode = 1;    // 0 = spin, 1 = streaming workers, 2 = all threads
+static uint64_t spinGapTicks;
+static struct timespec yieldSleep = {0, 50000};
+
+static int backoffYield(void) {
+    atomic_fetch_add_explicit(&macfixYields, 1, memory_order_relaxed);
+    static __thread struct {
+        bool named, eligible;
+        uint32_t streak;
+        uint64_t last;
+    } y;
+    if (yieldMode && !y.named) {
+        char name[64] = "";
+        pthread_getname_np(pthread_self(), name, sizeof(name));
+        y.named = name[0] != 0;
+        y.eligible = yieldMode == 2 || strncmp(name, "Streaming Pool", 14) == 0;
+    }
+    if (yieldMode && y.eligible) {
+        uint64_t t = mach_absolute_time();
+        y.streak = t - y.last < spinGapTicks ? y.streak + 1 : 0;
+        y.last = t;
+        if (y.streak >= 16) {
+            nanosleep(&yieldSleep, NULL);
+            y.last = mach_absolute_time();
+            return 0;
+        }
+    }
+    return sched_yield();
+}
+
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+    const void *replacement, *original;
+} interposeYield = {(const void *)backoffYield, (const void *)sched_yield};
+
 static void installSched(void) {
     const char *mode = getenv("MACFIX_SCHED");
     schedMode = !mode ? 0 : !strcmp(mode, "game") ? 1 : !strcmp(mode, "drop") ? 2 : 0;
+    const char *yield = getenv("MACFIX_YIELD"), *sleepUs = getenv("MACFIX_YIELD_SLEEP_US");
+    yieldMode = !yield ? 1 : !strcmp(yield, "spin") ? 0 : !strcmp(yield, "all") ? 2 : 1;
+    if (sleepUs) {
+        yieldSleep.tv_nsec = atoi(sleepUs) * 1000L;
+    }
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    spinGapTicks = 20000ULL * tb.denom / tb.numer;  // yields closer than 20 µs apart are a spin
+    const char *cores = getenv("MACFIX_CORES");
+    coreOverride = cores ? (unsigned)atoi(cores) : 0;
 }
 
 void agentStart(void);
@@ -252,6 +356,7 @@ void agentStart(void);
 __attribute__((constructor)) static void init(void) {
     installSched();
     installFrameRate();
+    installPointerLockThrottle();
     agentStart();
     installInputRepair();
     installCleanExit();
