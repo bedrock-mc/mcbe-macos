@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
+#import <netdb.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
@@ -191,6 +192,26 @@ static void installCleanExit(void) {
         NSLog(@"[macfix] -[UIApplication _terminateWithStatus:] not found");
     }
 }
+
+// When the game can't format a network interface's address (seen with a
+// WireGuard utun interface), it resolves the placeholder "Error" as a hostname
+// on the main thread every frame. macOS takes 5 s to fail a dotless name, so
+// the game freezes after the loading screen. Fail that lookup immediately.
+static atomic_bool loggedErrorLookup;
+
+static int fastGetaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    if (node && strcmp(node, "Error") == 0) {
+        if (!atomic_exchange(&loggedErrorLookup, true)) {
+            NSLog(@"[macfix] failing lookup of placeholder host \"Error\"");
+        }
+        return EAI_NONAME;
+    }
+    return getaddrinfo(node, service, hints, res);
+}
+
+__attribute__((used, section("__DATA,__interpose"))) static const struct {
+    const void *replacement, *original;
+} interposeGetaddrinfo = {(const void *)fastGetaddrinfo, (const void *)getaddrinfo};
 
 void agentStart(void);
 
