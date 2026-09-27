@@ -13,12 +13,13 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
+#import <mach/mach.h>
+#import <pthread.h>
 #import <sys/socket.h>
 
-extern CAFrameRateRange macfixGameFrameRate;
+extern int macfixFpsCap;  // main thread only
+void macfixApplyFrameRate(void);
 
-static CAFrameRateRange defaultFrameRate;  // macfix's rate, restored by cap 0
-static int fpsCap;             // 0 = macfix default; main thread only
 static double mouseX, mouseY;  // last absolute position, in screenshot pixels; main thread only
 
 #pragma mark - Game objects
@@ -61,6 +62,8 @@ static UIView<UIKeyInput> *focusedTextInput(void) {
 #pragma mark - Frames
 
 static atomic_bool captureRequested;
+static atomic_bool readbackEnabled;
+static CAMetalLayer *gameLayer;  // set from the render thread, read on main
 static dispatch_semaphore_t captureDone;
 static id<MTLTexture> captureTexture;  // written by the render thread before captureDone signals
 static atomic_int frameWidth, frameHeight;
@@ -88,22 +91,227 @@ static double currentFps(void) {
     return now() - lastPresent > 1.0 ? 0 : measuredFps;
 }
 
+#pragma mark - Frame timing
+
+// Timestamps for frame_stats; each series has a single writer thread.
+enum { kRing = 1 << 15 };
+typedef struct {
+    double t[kRing];
+    atomic_uint n;
+} Series;
+static Series submits, presents, drawStarts;
+static atomic_uint dropped;
+static double drawCost[kRing];  // drawFrame duration, indexed like drawStarts
+
+static void record(Series *s, double t) {
+    unsigned i = atomic_load_explicit(&s->n, memory_order_relaxed);
+    s->t[i % kRing] = t;
+    atomic_store_explicit(&s->n, i + 1, memory_order_release);
+}
+
+static int cmpDouble(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+// Percentiles of values in ms; sorts in place.
+static NSDictionary *percentiles(double *v, unsigned n, double span) {
+    if (n < 2) {
+        return @{@"n": @(n)};
+    }
+    qsort(v, n, sizeof(double), cmpDouble);
+    double sum = 0;
+    unsigned over = 0;
+    for (unsigned i = 0; i < n; i++) {
+        sum += v[i];
+    }
+    double p50 = v[n / 2];
+    for (unsigned i = 0; i < n; i++) {
+        over += v[i] > p50 * 1.5;
+    }
+#define R(x) @(round((x) * 100) / 100)
+    NSMutableDictionary *d = [@{@"n": @(n), @"mean": R(sum / n), @"p50": R(p50), @"p90": R(v[n * 90 / 100]),
+                                @"p95": R(v[n * 95 / 100]), @"p99": R(v[n * 99 / 100]), @"max": R(v[n - 1]),
+                                @"over_1_5x_p50": @(over)} mutableCopy];
+    if (span > 0) {
+        d[@"fps"] = R(n / span);
+    }
+#undef R
+    return d;
+}
+
+static NSDictionary *intervalStats(Series *s, unsigned from) {
+    unsigned to = atomic_load_explicit(&s->n, memory_order_acquire);
+    if (to - from > kRing) {
+        from = to - kRing;
+    }
+    if (to - from < 3) {
+        return @{@"n": @0};
+    }
+    unsigned n = to - from - 1;
+    double *v = malloc(n * sizeof(double));
+    for (unsigned i = 0; i < n; i++) {
+        v[i] = (s->t[(from + i + 1) % kRing] - s->t[(from + i) % kRing]) * 1000;
+    }
+    double span = s->t[(to - 1) % kRing] - s->t[from % kRing];
+    NSDictionary *d = percentiles(v, n, span);
+    free(v);
+    return d;
+}
+
+static NSDictionary *costStats(unsigned from) {
+    unsigned to = atomic_load_explicit(&drawStarts.n, memory_order_acquire);
+    if (to - from > kRing) {
+        from = to - kRing;
+    }
+    if (to - from < 3) {
+        return @{@"n": @0};
+    }
+    unsigned n = to - from - 1;  // the newest entry may still be running
+    double *v = malloc(n * sizeof(double));
+    for (unsigned i = 0; i < n; i++) {
+        v[i] = drawCost[(from + i) % kRing] * 1000;
+    }
+    NSDictionary *d = percentiles(v, n, 0);
+    free(v);
+    return d;
+}
+
+static unsigned submitsFrom, presentsFrom, drawsFrom, droppedFrom;
+static double statsFrom;
+
+// CPU time per thread (µs), keyed by thread id, with its pool name ("Streaming Pool(3)" -> "Streaming Pool").
+static NSDictionary<NSNumber *, NSArray *> *threadTimes(void) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    thread_act_array_t list;
+    mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) {
+        return out;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_extended_info_data_t ext;
+        thread_identifier_info_data_t ident;
+        mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT, in = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n) == KERN_SUCCESS &&
+            thread_info(list[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &in) == KERN_SUCCESS) {
+            NSString *name = @(ext.pth_name);
+            NSRange paren = [name rangeOfString:@"("];
+            if (paren.location != NSNotFound) {
+                name = [name substringToIndex:paren.location];
+            }
+            out[@(ident.thread_id)] = @[name.length ? name : @"(unnamed)", @(ext.pth_user_time / 1000), @(ext.pth_system_time / 1000)];
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof(thread_act_t));
+    return out;
+}
+
+static NSDictionary *cpuFrom;
+
+// CPU % (100 = one core) by thread group since the last reset, split into user and system.
+static NSDictionary *cpuStats(double span) {
+    NSDictionary *nowTimes = threadTimes();
+    NSMutableDictionary<NSString *, NSMutableArray *> *groups = [NSMutableDictionary dictionary];
+    double totalUser = 0, totalSys = 0;
+    for (NSNumber *tid in nowTimes) {
+        NSArray *cur = nowTimes[tid], *old = cpuFrom[tid];
+        double user = [cur[1] doubleValue] - [old[1] doubleValue], sys = [cur[2] doubleValue] - [old[2] doubleValue];
+        NSMutableArray *g = groups[cur[0]] ?: (groups[cur[0]] = [@[@0.0, @0.0, @0] mutableCopy]);
+        g[0] = @([g[0] doubleValue] + user);
+        g[1] = @([g[1] doubleValue] + sys);
+        g[2] = @([g[2] intValue] + 1);
+        totalUser += user;
+        totalSys += sys;
+    }
+    double scale = span > 0 ? 100 / (span * 1e6) : 0;
+    NSMutableDictionary *byGroup = [NSMutableDictionary dictionary];
+    for (NSString *name in groups) {
+        NSArray *g = groups[name];
+        double total = ([g[0] doubleValue] + [g[1] doubleValue]) * scale;
+        if (total >= 1) {
+            byGroup[name] = @{@"user": @(round([g[0] doubleValue] * scale)), @"sys": @(round([g[1] doubleValue] * scale)),
+                              @"threads": g[2]};
+        }
+    }
+    return @{@"total": @(round((totalUser + totalSys) * scale)), @"user": @(round(totalUser * scale)),
+             @"sys": @(round(totalSys * scale)), @"groups": byGroup};
+}
+
+static id syncOnMain(id (^block)(void));
+
+// macOS drops every present (presentedTime 0) while no part of the app is visible, e.g. under the screen saver.
+static NSNumber *onScreen(void) {
+    return syncOnMain(^id {
+        id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+        NSUInteger occlusion = ((NSUInteger (*)(id, SEL))objc_msgSend)(app, sel_registerName("occlusionState"));
+        return @((occlusion & (1 << 1)) != 0);  // NSApplicationOcclusionStateVisible
+    });
+}
+
+// Intervals between submitted and on-screen presents, and main-thread drawFrame cost, since the last reset.
+static NSDictionary *frameStats(NSDictionary *req) {
+    NSDictionary *d = @{@"ok": @YES, @"on_screen": onScreen(), @"submit_interval_ms": intervalStats(&submits, submitsFrom),
+                        @"present_interval_ms": intervalStats(&presents, presentsFrom),
+                        @"drawframe_interval_ms": intervalStats(&drawStarts, drawsFrom),
+                        @"drawframe_cost_ms": costStats(drawsFrom), @"dropped": @(atomic_load(&dropped) - droppedFrom),
+                        @"cpu_percent": cpuStats(now() - statsFrom)};
+    if ([req[@"reset"] boolValue]) {
+        submitsFrom = atomic_load(&submits.n);
+        presentsFrom = atomic_load(&presents.n);
+        drawsFrom = atomic_load(&drawStarts.n);
+        droppedFrom = atomic_load(&dropped);
+        cpuFrom = threadTimes();
+        statsFrom = now();
+    }
+    if (req[@"label"]) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingSortedKeys error:NULL];
+        NSLog(@"[macfix] frame_stats %@: %@", req[@"label"], [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]);
+    }
+    return d;
+}
+
+static IMP origDrawFrame;
+
+static void drawFrame(id self, SEL _cmd) {
+    double t = now();
+    unsigned i = atomic_load_explicit(&drawStarts.n, memory_order_relaxed);
+    record(&drawStarts, t);
+    ((void (*)(id, SEL))origDrawFrame)(self, _cmd);
+    drawCost[i % kRing] = now() - t;
+}
+
+static void installDrawFrameHook(void) {
+    Class cls = objc_lookUpClass("minecraftpeViewControllerImpl") ?: objc_lookUpClass("minecraftpeViewControllerBase");
+    Method m = cls ? class_getInstanceMethod(cls, sel_registerName("drawFrame")) : NULL;
+    if (m) {
+        origDrawFrame = method_setImplementation(m, (IMP)drawFrame);
+    }
+}
+
 static void presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
     countPresent();
+    record(&submits, now());
+    [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+        if (d.presentedTime > 0) {  // 0 when the frame was dropped
+            record(&presents, d.presentedTime);
+        } else {
+            atomic_fetch_add(&dropped, 1);
+        }
+    }];
     if ([drawable conformsToProtocol:@protocol(CAMetalDrawable)]) {
         id<CAMetalDrawable> metal = (id<CAMetalDrawable>)drawable;
         id<MTLTexture> src = metal.texture;
         frameWidth = (int)src.width;
         frameHeight = (int)src.height;
+        if (gameLayer != metal.layer) {
+            gameLayer = metal.layer;
+        }
         if (src.framebufferOnly) {
-            // Readback needs a blittable drawable; this applies from the next one on.
-            static atomic_flag once = ATOMIC_FLAG_INIT;
-            if (!atomic_flag_test_and_set(&once)) {
+            // Readback needs a blittable drawable; enabled per screenshot since it costs frame time.
+            if (captureRequested && !atomic_exchange(&readbackEnabled, true)) {
                 CAMetalLayer *layer = metal.layer;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    layer.framebufferOnly = NO;
-                    NSLog(@"[macfix] agent: drawable readback enabled");
-                });
+                dispatch_async(dispatch_get_main_queue(), ^{ layer.framebufferOnly = NO; });
             }
         } else if (atomic_exchange(&captureRequested, false)) {
             id<MTLCommandBuffer> buffer = self;
@@ -121,6 +329,11 @@ static void presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
                 captureTexture = copy;
                 dispatch_semaphore_signal(captureDone);
             }];
+            CAMetalLayer *layer = metal.layer;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                layer.framebufferOnly = YES;
+                readbackEnabled = false;
+            });
         }
     }
     ((void (*)(id, SEL, id))origPresentDrawable)(self, _cmd, drawable);
@@ -433,8 +646,12 @@ static NSDictionary *handleMouseMove(NSDictionary *req) {
         if (!handler) {
             return @{@"ok": @NO, @"error": input ? @"the game has no mouse-move handler" : @"no mouse connected"};
         }
-        // GameController deltas are y-up; the protocol's are screen-space.
-        handler(input, dx, -dy);
+        // GameController deltas are y-up; the protocol's are screen-space. "split" delivers the
+        // move as several events, like a high-rate mouse between two frames.
+        int split = MAX([req[@"split"] intValue], 1);
+        for (int i = 0; i < split; i++) {
+            handler(input, dx / split, -dy / split);
+        }
         return @{@"ok": @YES};
     });
 }
@@ -456,14 +673,64 @@ static NSDictionary *handleScroll(NSDictionary *req) {
 #pragma mark - Commands
 
 static void applyFrameCap(int cap) {
-    fpsCap = MAX(cap, 0);
-    macfixGameFrameRate = fpsCap > 0 ? CAFrameRateRangeMake(fpsCap, fpsCap, fpsCap) : defaultFrameRate;
-    UIViewController *vc = gameViewController();
-    SEL sel = sel_registerName("displayLink");
-    CADisplayLink *link = [vc respondsToSelector:sel] ? ((id (*)(id, SEL))objc_msgSend)(vc, sel) : nil;
-    if ([link isKindOfClass:[CADisplayLink class]]) {
-        link.preferredFrameRateRange = macfixGameFrameRate;
+    macfixFpsCap = MAX(cap, 0);
+    macfixApplyFrameRate();
+}
+
+static NSDictionary *layerInfo(CAMetalLayer *l) {
+    return @{@"maximumDrawableCount": @(l.maximumDrawableCount), @"displaySyncEnabled": @(l.displaySyncEnabled),
+             @"presentsWithTransaction": @(l.presentsWithTransaction), @"framebufferOnly": @(l.framebufferOnly),
+             @"allowsNextDrawableTimeout": @(l.allowsNextDrawableTimeout), @"pixelFormat": @(l.pixelFormat),
+             @"drawableSize": NSStringFromCGSize(l.drawableSize), @"contentsScale": @(l.contentsScale),
+             @"bounds": NSStringFromCGRect(l.bounds), @"opaque": @(l.opaque),
+             @"wantsExtendedDynamicRangeContent": [l valueForKey:@"wantsExtendedDynamicRangeContent"],
+             @"colorspace": l.colorspace ? CFBridgingRelease(CGColorSpaceCopyName(l.colorspace)) ?: @"?" : @"none",
+             @"superlayers": @([l.superlayer.sublayers count])};
+}
+
+// Reads the game's CAMetalLayer and applies "set" (KVC keys) for A/B experiments.
+static NSDictionary *handleLayer(NSDictionary *req) {
+    return syncOnMain(^id {
+        CAMetalLayer *l = gameLayer;
+        if (!l) {
+            return @{@"ok": @NO, @"error": @"no frame presented yet"};
+        }
+        NSDictionary *set = req[@"set"];
+        if ([set isKindOfClass:[NSDictionary class]]) {
+            @try {
+                [set enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) { [l setValue:v forKey:k]; }];
+            } @catch (NSException *e) {  // a wrongly typed value; uncaught, it would crash the game
+                return @{@"ok": @NO, @"error": e.reason ?: e.name};
+            }
+        }
+        return @{@"ok": @YES, @"layer": layerInfo(l)};
+    });
+}
+
+// Scheduling state of every thread in the game, for tuning priorities.
+static NSDictionary *handleThreads(NSDictionary *req) {
+    thread_act_array_t list;
+    mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) {
+        return @{@"ok": @NO, @"error": @"task_threads failed"};
     }
+    NSMutableArray *out = [NSMutableArray array];
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_extended_info_data_t ext;
+        mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n) == KERN_SUCCESS) {
+            thread_precedence_policy_data_t prec = {0};
+            mach_msg_type_number_t pn = THREAD_PRECEDENCE_POLICY_COUNT;
+            boolean_t def = 0;
+            thread_policy_get(list[i], THREAD_PRECEDENCE_POLICY, (thread_policy_t)&prec, &pn, &def);
+            [out addObject:@{@"name": @(ext.pth_name), @"cur": @(ext.pth_curpri), @"base": @(ext.pth_priority),
+                             @"max": @(ext.pth_maxpriority), @"policy": @(ext.pth_policy), @"importance": @(prec.importance),
+                             @"cpu_ms": @((ext.pth_user_time + ext.pth_system_time) / 1000000)}];
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof(thread_act_t));
+    return @{@"ok": @YES, @"threads": out};
 }
 
 static NSDictionary *state(void) {
@@ -476,7 +743,7 @@ static NSDictionary *state(void) {
         BOOL wantsLock = [vc respondsToSelector:@selector(prefersPointerLocked)] && vc.prefersPointerLocked;
         BOOL typing = focusedTextInput() != nil;
         return @{@"ok": @YES, @"width": @(frameWidth), @"height": @(frameHeight), @"focused": @(focused),
-                 @"fps": @(round(currentFps() * 10) / 10), @"fps_cap": @(fpsCap), @"cursor_locked": @(locked),
+                 @"fps": @(round(currentFps() * 10) / 10), @"fps_cap": @(macfixFpsCap), @"cursor_locked": @(locked),
                  @"pointer_lock_requested": @(wantsLock), @"text_input": @(typing),
                  @"mouse_x": @(mouseX), @"mouse_y": @(mouseY)};
     });
@@ -545,8 +812,17 @@ static NSDictionary *handle(NSDictionary *req) {
         int cap = [req[@"cap"] intValue];
         return syncOnMain(^id {
             applyFrameCap(cap);
-            return @{@"ok": @YES, @"fps_cap": @(fpsCap)};
+            return @{@"ok": @YES, @"fps_cap": @(macfixFpsCap)};
         });
+    }
+    if ([cmd isEqual:@"threads"]) {
+        return handleThreads(req);
+    }
+    if ([cmd isEqual:@"layer"]) {
+        return handleLayer(req);
+    }
+    if ([cmd isEqual:@"frame_stats"]) {
+        return frameStats(req);
     }
     if ([cmd isEqual:@"quit"]) {
         // The app menu's Quit path, so the game saves and shuts down normally.
@@ -677,7 +953,6 @@ void agentStart(void) {
         return;
     }
     captureDone = dispatch_semaphore_create(0);
-    defaultFrameRate = macfixGameFrameRate;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -692,6 +967,7 @@ void agentStart(void) {
     }
     NSLog(@"[macfix] agent: listening on 127.0.0.1:%d", port);
     dispatch_async(dispatch_get_main_queue(), ^{ installPresentHook(); });
+    installDrawFrameHook();
     const char *hidden = getenv("MACFIX_AGENT_HIDDEN");
     if (hidden && strcmp(hidden, "1") == 0) {
         installHidden();

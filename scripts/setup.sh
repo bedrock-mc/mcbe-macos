@@ -4,6 +4,7 @@
 #
 # usage: scripts/setup.sh <minecraft.ipa>     install, configure and patch
 #        scripts/setup.sh --patch-only         re-patch an installed app
+#        scripts/setup.sh --patch-only --debuggable   same, attachable by Instruments/lldb
 #        scripts/setup.sh --reset-playchain    fix "Couldn't add the Keychain Item" crashes
 set -euo pipefail
 
@@ -114,8 +115,8 @@ configure() {
     plutil -replace aspectRatio -integer 2 "$SETTINGS"
     plutil -replace windowWidth -integer 1728 "$SETTINGS"
     plutil -replace windowHeight -integer 1080 "$SETTINGS"
-    # 2.0 renders 3456x2160, more pixels than a MacBook screen shows; 1.5 holds 120 FPS better.
-    plutil -replace customScaler -float 1.5 "$SETTINGS"
+    # GPU time scales with pixels: at 1.5 (2592x1620) busy scenes miss the 120 Hz budget.
+    plutil -replace customScaler -float 1.25 "$SETTINGS"
 }
 
 patch_app() {
@@ -129,7 +130,7 @@ patch_app() {
     xcrun clang -target arm64-apple-ios15.0-macabi \
         -isysroot "$sdk" -iframework "$sdk/System/iOSSupport/System/Library/Frameworks" \
         -dynamiclib -fobjc-arc -framework Foundation -framework GameController -framework QuartzCore \
-        -framework UIKit -framework Metal -framework CoreImage -framework ImageIO -framework CoreGraphics \
+        -framework UIKit -framework Metal -framework CoreImage -framework ImageIO -framework CoreGraphics -framework IOKit \
         -install_name @executable_path/Frameworks/libmacfix.dylib \
         -o "$BUILD/libmacfix.dylib" "$ROOT/macfix/macfix.m" "$ROOT/macfix/agent.m"
     codesign -f -s - "$BUILD/libmacfix.dylib"
@@ -137,6 +138,11 @@ patch_app() {
     step "Patching the app"
     local ent="$BUILD/entitlements.plist"
     codesign -d --entitlements - --xml "$APP_DIR" > "$ent" 2>/dev/null
+    # Profiling only: lets xctrace/lldb attach. Plain runs drop it again.
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.security.get-task-allow" "$ent" >/dev/null 2>&1 || true
+    if [ "$DEBUGGABLE" = 1 ]; then
+        /usr/libexec/PlistBuddy -c "Add :com.apple.security.get-task-allow bool true" "$ent"
+    fi
     cp "$BUILD/libmacfix.dylib" "$APP_DIR/Frameworks/libmacfix.dylib"
     python3 "$ROOT/scripts/patch_app.py" "$APP_DIR/minecraftpe"
     # Marks the app as a game so fullscreen gets macOS Game Mode.
@@ -146,8 +152,13 @@ patch_app() {
     codesign -v "$APP_DIR"
 }
 
+DEBUGGABLE=0
+
 main() {
     check_host
+    if [ "${2:-}" = --debuggable ]; then
+        DEBUGGABLE=1
+    fi
     case "${1:-}" in
         --patch-only) patch_app ;;
         --reset-playchain) reset_playchain; exit 0 ;;
