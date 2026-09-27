@@ -159,11 +159,9 @@ static void installFrameRate(void) {
     NSLog(@"[macfix] frame rate hook installed");
 }
 
-// The game's mouse-move handler calls -setNeedsUpdateOfPrefersPointerLocked
-// on every event, and UIKit re-resolves the scene's lock state (building
-// description strings) each time: ~0.1 ms of main-thread time per event,
-// several per frame with a high-rate mouse. Forward only changes, plus a
-// periodic refresh in case UIKit wants one. MACFIX_POINTER_LOCK=every disables.
+// The game requests a pointer-lock update on every mouse move, and UIKit
+// re-resolves the scene's lock state each time (~0.1 ms of main thread per
+// event). Forward changes plus a 0.5 s refresh. MACFIX_POINTER_LOCK=every disables.
 static IMP origSetNeedsPointerLock;
 static int lastPointerLock = -1;
 static double lastPointerLockUpdate;

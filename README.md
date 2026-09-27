@@ -15,6 +15,7 @@ Tested with Minecraft 1.26.50 on an M3 Pro, macOS 26.5.
 | 60 FPS cap on 120 Hz displays | Raises the game's render loop to 120 Hz |
 | Closing the window leaves the game stuck in the background | Exits cleanly after the game has saved (its exit path otherwise deadlocks) |
 | Freezes after the loading screen with a VPN (e.g. WireGuard) connected | Fails the game's per-frame lookup of the bogus host `Error` instantly instead of after macOS's 5 s timeout |
+| Game uses about four CPU cores in a world | Chunk-streaming threads sleep briefly instead of spinning, which roughly halves CPU use (see [Performance](#performance)) |
 | "Invalid key" beep on every WASD press | Silences it for keys the game reads directly |
 | Game Mode stays off; crash with keymapping; black bars | Marks the app as a game; keymapping off; 1080p at 16:10 |
 
@@ -44,6 +45,19 @@ claude mcp add minecraft -e MCPELAUNCHER_BACKEND=ios -- bun run /path/to/mcpelau
 ```
 
 One instance per Mac. The server is off in normal launches (`MACFIX_AGENT_PORT` enables it, `MACFIX_AGENT_HIDDEN=1` hides the window).
+
+## Performance
+
+The game's chunk-streaming threads spin on `sched_yield` between jobs, over two cores of mostly kernel time. `libmacfix` makes a thread that is clearly spinning sleep for 50 µs instead. It also forwards the game's per-mouse-move pointer-lock updates to UIKit only when they change.
+
+Measured in a local world at 120 Hz on an M3 Pro, 30 s camera sweeps, 4–6 runs each:
+
+| | Game CPU | Streaming threads | Main thread | FPS | Frame interval p50 / p95 |
+| --- | --- | --- | --- | --- | --- |
+| Without the fixes | ~410% | ~255% | ~37% | ~102 | 8.3 / 16.7 ms |
+| With them | ~210% | ~65% | ~27% | ~102 | 8.3 / 16.7 ms |
+
+To compare, or if something regresses, launch with `open --env MACFIX_YIELD=spin <app>` to restore the spinning, or `MACFIX_POINTER_LOCK=every` to forward every update. With the agent server on, `frame_stats` reports frame intervals and CPU per thread group, and `threads` the scheduling state of each thread; `scripts/setup.sh --patch-only --debuggable` lets Instruments attach.
 
 ## Troubleshooting
 
