@@ -241,9 +241,20 @@ static NSDictionary *cpuStats(double span) {
              @"sys": @(round(totalSys * scale)), @"groups": byGroup};
 }
 
+static id syncOnMain(id (^block)(void));
+
+// macOS drops every present (presentedTime 0) while no part of the app is visible, e.g. under the screen saver.
+static NSNumber *onScreen(void) {
+    return syncOnMain(^id {
+        id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+        NSUInteger occlusion = ((NSUInteger (*)(id, SEL))objc_msgSend)(app, sel_registerName("occlusionState"));
+        return @((occlusion & (1 << 1)) != 0);  // NSApplicationOcclusionStateVisible
+    });
+}
+
 // Intervals between submitted and on-screen presents, and main-thread drawFrame cost, since the last reset.
 static NSDictionary *frameStats(NSDictionary *req) {
-    NSDictionary *d = @{@"ok": @YES, @"submit_interval_ms": intervalStats(&submits, submitsFrom),
+    NSDictionary *d = @{@"ok": @YES, @"on_screen": onScreen(), @"submit_interval_ms": intervalStats(&submits, submitsFrom),
                         @"present_interval_ms": intervalStats(&presents, presentsFrom),
                         @"drawframe_interval_ms": intervalStats(&drawStarts, drawsFrom),
                         @"drawframe_cost_ms": costStats(drawsFrom), @"dropped": @(atomic_load(&dropped) - droppedFrom),
