@@ -179,8 +179,6 @@ static NSDictionary *costStats(unsigned from) {
 }
 
 static unsigned submitsFrom, presentsFrom, drawsFrom, droppedFrom;
-extern atomic_ullong macfixYields;
-static unsigned long long yieldsFrom;
 static double statsFrom;
 
 // CPU time per thread (µs), keyed by thread id, with its pool name ("Streaming Pool(3)" -> "Streaming Pool").
@@ -258,14 +256,12 @@ static NSDictionary *frameStats(NSDictionary *req) {
                         @"present_interval_ms": intervalStats(&presents, presentsFrom),
                         @"drawframe_interval_ms": intervalStats(&drawStarts, drawsFrom),
                         @"drawframe_cost_ms": costStats(drawsFrom), @"dropped": @(atomic_load(&dropped) - droppedFrom),
-                        @"cpu_percent": cpuStats(now() - statsFrom),
-                        @"yields_per_s": @(round((atomic_load(&macfixYields) - yieldsFrom) / MAX(now() - statsFrom, 1e-3)))};
+                        @"cpu_percent": cpuStats(now() - statsFrom)};
     if ([req[@"reset"] boolValue]) {
         submitsFrom = atomic_load(&submits.n);
         presentsFrom = atomic_load(&presents.n);
         drawsFrom = atomic_load(&drawStarts.n);
         droppedFrom = atomic_load(&dropped);
-        yieldsFrom = atomic_load(&macfixYields);
         cpuFrom = threadTimes();
         statsFrom = now();
     }
