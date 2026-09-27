@@ -115,8 +115,8 @@ configure() {
     plutil -replace aspectRatio -integer 2 "$SETTINGS"
     plutil -replace windowWidth -integer 1728 "$SETTINGS"
     plutil -replace windowHeight -integer 1080 "$SETTINGS"
-    # 2.0 renders 3456x2160, more pixels than a MacBook screen shows; 1.5 holds 120 FPS better.
-    plutil -replace customScaler -float 1.5 "$SETTINGS"
+    # GPU time scales with pixels: at 1.5 (2592x1620) busy scenes miss the 120 Hz budget.
+    plutil -replace customScaler -float 1.25 "$SETTINGS"
 }
 
 patch_app() {
