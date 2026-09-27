@@ -13,6 +13,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
+#import <dlfcn.h>
 #import <unistd.h>
 
 // AppKit beeps for key events the game reads via GameController but never
@@ -26,7 +27,25 @@ static void noResponderFor(id self, SEL _cmd, SEL eventSelector) {
     ((void (*)(id, SEL, SEL))origNoResponderFor)(self, _cmd, eventSelector);
 }
 
+// Esc also reaches NSWindow -cancelOperation:, which leaves full screen (and
+// beeps in a window), so closing a UI with Esc dropped the game out of full
+// screen. Keep Esc for the game; the green button and Ctrl-Cmd-F still leave
+// full screen.
+static void cancelOperation(id self, SEL _cmd, id sender) {
+}
+
+static void installFullScreenEscape(void) {
+    Class window = objc_getClass("NSWindow");
+    Method m = window ? class_getInstanceMethod(window, sel_registerName("cancelOperation:")) : NULL;
+    if (m) {
+        method_setImplementation(m, (IMP)cancelOperation);
+    } else {
+        NSLog(@"[macfix] NSWindow -cancelOperation: not found");
+    }
+}
+
 static void installNoBeep(void) {
+    installFullScreenEscape();
     Class responder = objc_getClass("NSResponder");
     Method m = responder ? class_getInstanceMethod(responder, @selector(noResponderFor:)) : NULL;
     if (m) {
@@ -270,17 +289,83 @@ static void installFrameRate(void) {
     installPowerAwareRate();
 }
 
+// In a window (not full screen) macOS only grants the game's pointer lock
+// after a click, so closing a UI in-world leaves the cursor visible and free
+// to leave the window until the next click. When the game asks for the lock
+// again, hide the cursor and detach it from the mouse ourselves (the game
+// reads GameController deltas, which keep coming), and let go when it no
+// longer wants the lock or the app loses focus. MACFIX_CAPTURE=0 disables.
+static bool captureEnabled;
+static bool captured;
+static int lastWanted = -1;
+static int32_t (*associateMouse)(uint32_t);
+static int32_t (*warpMouse)(CGPoint);
+
+static void releaseCursor(void) {
+    if (!captured) {
+        return;
+    }
+    captured = false;
+    associateMouse(1);
+    ((void (*)(id, SEL))objc_msgSend)(objc_lookUpClass("NSCursor"), sel_registerName("unhide"));
+}
+
+static void captureCursor(UIViewController *vc) {
+    UIWindow *window = vc.view.window;
+    if (captured || !associateMouse || !warpMouse || !window.isKeyWindow ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+        return;
+    }
+    // Park the cursor mid-window so a stray click can't land on another app.
+    id nsApp = ((id (*)(id, SEL))objc_msgSend)(objc_lookUpClass("NSApplication"), sel_registerName("sharedApplication"));
+    id nsWindow = ((id (*)(id, SEL))objc_msgSend)(nsApp, sel_registerName("keyWindow"));
+    NSArray *screens = ((id (*)(id, SEL))objc_msgSend)(objc_lookUpClass("NSScreen"), sel_registerName("screens"));
+    if (nsWindow && screens.count) {
+        CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(nsWindow, sel_registerName("frame"));
+        CGRect main = ((CGRect (*)(id, SEL))objc_msgSend)(screens[0], sel_registerName("frame"));
+        warpMouse(CGPointMake(CGRectGetMidX(frame), main.size.height - CGRectGetMidY(frame)));
+    }
+    associateMouse(0);
+    ((void (*)(id, SEL))objc_msgSend)(objc_lookUpClass("NSCursor"), sel_registerName("hide"));
+    captured = true;
+}
+
+static void updateCapture(UIViewController *vc, int wanted) {
+    if (!captureEnabled) {
+        return;
+    }
+    if (!wanted) {
+        releaseCursor();
+    } else if (lastWanted == 0) {  // a UI just closed, or a world was entered
+        captureCursor(vc);
+    }
+    lastWanted = wanted;
+}
+
+static void installCapture(void) {
+    const char *mode = getenv("MACFIX_CAPTURE");
+    captureEnabled = !(mode && !strcmp(mode, "0"));
+    associateMouse = dlsym(RTLD_DEFAULT, "CGAssociateMouseAndMouseCursorPosition");
+    warpMouse = dlsym(RTLD_DEFAULT, "CGWarpMouseCursorPosition");
+    for (NSNotificationName name in @[UIApplicationWillResignActiveNotification, UIWindowDidResignKeyNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *n) { releaseCursor(); }];
+    }
+}
+
 // The game requests a pointer-lock update on every mouse move, and UIKit
 // re-resolves the scene's lock state each time (~0.1 ms of main thread per
 // event). Forward changes plus a 0.5 s refresh. MACFIX_POINTER_LOCK=every disables.
 static IMP origSetNeedsPointerLock;
+static bool throttlePointerLock;
 static int lastPointerLock = -1;
 static double lastPointerLockUpdate;
 
 static void setNeedsPointerLock(UIViewController *self, SEL _cmd) {
     int wanted = self.prefersPointerLocked;
+    updateCapture(self, wanted);
     double t = CACurrentMediaTime();
-    if (wanted == lastPointerLock && t - lastPointerLockUpdate < 0.5) {
+    if (throttlePointerLock && wanted == lastPointerLock && t - lastPointerLockUpdate < 0.5) {
         return;
     }
     lastPointerLock = wanted;
@@ -290,9 +375,8 @@ static void setNeedsPointerLock(UIViewController *self, SEL _cmd) {
 
 static void installPointerLockThrottle(void) {
     const char *mode = getenv("MACFIX_POINTER_LOCK");
-    if (mode && !strcmp(mode, "every")) {
-        return;
-    }
+    throttlePointerLock = !(mode && !strcmp(mode, "every"));
+    installCapture();
     Class cls = objc_lookUpClass("minecraftpeViewControllerImpl") ?: objc_lookUpClass("minecraftpeViewControllerBase");
     SEL sel = sel_registerName("setNeedsUpdateOfPrefersPointerLocked");
     Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;

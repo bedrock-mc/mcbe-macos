@@ -17,6 +17,8 @@ Tested with Minecraft 1.26.50 on an M3 Pro, macOS 26.5.
 | Closing the window leaves the game stuck in the background | Exits cleanly after the game has saved (its exit path otherwise deadlocks) |
 | Freezes after the loading screen with a VPN (e.g. WireGuard) connected | Fails the game's per-frame lookup of the bogus host `Error` instantly instead of after macOS's 5 s timeout |
 | Game uses about four CPU cores in a world | Chunk-streaming threads sleep briefly instead of spinning, which roughly halves CPU use (see [Performance](#performance)) |
+| In a window, closing an in-game UI leaves the cursor visible and free to leave the window until you click | Hides and holds the cursor when the game asks for the pointer lock again (`MACFIX_CAPTURE=0` turns this off) |
+| Esc (e.g. closing a UI) leaves full screen, or beeps in a window | Keeps Esc for the game; the green button and Ctrl-Cmd-F still leave it |
 | Scroll wheel and trackpad scrolling do nothing | Passes the vertical scroll amount in the value the game reads |
 | "Invalid key" beep on every WASD press | Silences it for keys the game reads directly |
 | Game Mode stays off; crash with keymapping; black bars | Marks the app as a game; keymapping off; 1080p at 16:10 |
