@@ -50,12 +50,12 @@ One instance per Mac. The server is off in normal launches (`MACFIX_AGENT_PORT` 
 
 The game's chunk-streaming threads spin on `sched_yield` between jobs, over two cores of mostly kernel time. `libmacfix` makes a thread that is clearly spinning sleep for 50 µs instead. It also forwards the game's per-mouse-move pointer-lock updates to UIKit only when they change.
 
-Measured in a local world at 120 Hz on an M3 Pro, 30 s camera sweeps, 4–6 runs each:
+Measured in a local world at 120 Hz on an M3 Pro, 30 s camera sweeps, 6 runs each:
 
 | | Game CPU | Streaming threads | Main thread | FPS | Frame interval p50 / p95 |
 | --- | --- | --- | --- | --- | --- |
-| Without the fixes | ~410% | ~255% | ~37% | ~102 | 8.3 / 16.7 ms |
-| With them | ~210% | ~65% | ~27% | ~102 | 8.3 / 16.7 ms |
+| Without the fixes | ~410% | ~260% | ~37% | ~100 | 8.3 / 16.7 ms |
+| With them | ~210% | ~67% | ~29% | ~103 | 8.3 / 16.7 ms |
 
 To compare, or if something regresses, launch with `open --env MACFIX_YIELD=spin <app>` to restore the spinning, or `MACFIX_POINTER_LOCK=every` to forward every update. With the agent server on, `frame_stats` reports frame intervals and CPU per thread group, and `threads` the scheduling state of each thread; `scripts/setup.sh --patch-only --debuggable` lets Instruments attach.
 
