@@ -704,7 +704,11 @@ static NSDictionary *handleLayer(NSDictionary *req) {
         }
         NSDictionary *set = req[@"set"];
         if ([set isKindOfClass:[NSDictionary class]]) {
-            [set enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) { [l setValue:v forKey:k]; }];
+            @try {
+                [set enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) { [l setValue:v forKey:k]; }];
+            } @catch (NSException *e) {  // a wrongly typed value; uncaught, it would crash the game
+                return @{@"ok": @NO, @"error": e.reason ?: e.name};
+            }
         }
         return @{@"ok": @YES, @"layer": layerInfo(l)};
     });
