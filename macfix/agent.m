@@ -17,10 +17,9 @@
 #import <pthread.h>
 #import <sys/socket.h>
 
-extern CAFrameRateRange macfixGameFrameRate;
+extern int macfixFpsCap;  // main thread only
+void macfixApplyFrameRate(void);
 
-static CAFrameRateRange defaultFrameRate;  // macfix's rate, restored by cap 0
-static int fpsCap;             // 0 = macfix default; main thread only
 static double mouseX, mouseY;  // last absolute position, in screenshot pixels; main thread only
 
 #pragma mark - Game objects
@@ -674,14 +673,8 @@ static NSDictionary *handleScroll(NSDictionary *req) {
 #pragma mark - Commands
 
 static void applyFrameCap(int cap) {
-    fpsCap = MAX(cap, 0);
-    macfixGameFrameRate = fpsCap > 0 ? CAFrameRateRangeMake(fpsCap, fpsCap, fpsCap) : defaultFrameRate;
-    UIViewController *vc = gameViewController();
-    SEL sel = sel_registerName("displayLink");
-    CADisplayLink *link = [vc respondsToSelector:sel] ? ((id (*)(id, SEL))objc_msgSend)(vc, sel) : nil;
-    if ([link isKindOfClass:[CADisplayLink class]]) {
-        link.preferredFrameRateRange = macfixGameFrameRate;
-    }
+    macfixFpsCap = MAX(cap, 0);
+    macfixApplyFrameRate();
 }
 
 static NSDictionary *layerInfo(CAMetalLayer *l) {
@@ -750,7 +743,7 @@ static NSDictionary *state(void) {
         BOOL wantsLock = [vc respondsToSelector:@selector(prefersPointerLocked)] && vc.prefersPointerLocked;
         BOOL typing = focusedTextInput() != nil;
         return @{@"ok": @YES, @"width": @(frameWidth), @"height": @(frameHeight), @"focused": @(focused),
-                 @"fps": @(round(currentFps() * 10) / 10), @"fps_cap": @(fpsCap), @"cursor_locked": @(locked),
+                 @"fps": @(round(currentFps() * 10) / 10), @"fps_cap": @(macfixFpsCap), @"cursor_locked": @(locked),
                  @"pointer_lock_requested": @(wantsLock), @"text_input": @(typing),
                  @"mouse_x": @(mouseX), @"mouse_y": @(mouseY)};
     });
@@ -819,7 +812,7 @@ static NSDictionary *handle(NSDictionary *req) {
         int cap = [req[@"cap"] intValue];
         return syncOnMain(^id {
             applyFrameCap(cap);
-            return @{@"ok": @YES, @"fps_cap": @(fpsCap)};
+            return @{@"ok": @YES, @"fps_cap": @(macfixFpsCap)};
         });
     }
     if ([cmd isEqual:@"threads"]) {
@@ -960,7 +953,6 @@ void agentStart(void) {
         return;
     }
     captureDone = dispatch_semaphore_create(0);
-    defaultFrameRate = macfixGameFrameRate;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));

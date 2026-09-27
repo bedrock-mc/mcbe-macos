@@ -13,6 +13,7 @@ Tested with Minecraft 1.26.50 on an M3 Pro, macOS 26.5.
 | --- | --- |
 | Clicks or keys dead for a whole session (hover still works) | Re-runs the game's mouse and keyboard setup when a startup race skipped it |
 | 60 FPS cap on 120 Hz displays | Raises the game's render loop to 120 Hz |
+| Battery drain | 60 FPS on battery or in Low Power Mode, 120 on AC |
 | Closing the window leaves the game stuck in the background | Exits cleanly after the game has saved (its exit path otherwise deadlocks) |
 | Freezes after the loading screen with a VPN (e.g. WireGuard) connected | Fails the game's per-frame lookup of the bogus host `Error` instantly instead of after macOS's 5 s timeout |
 | Game uses about four CPU cores in a world | Chunk-streaming threads sleep briefly instead of spinning, which roughly halves CPU use (see [Performance](#performance)) |
@@ -58,6 +59,8 @@ Measured in a local world at 120 Hz on an M3 Pro, 30 s camera sweeps, 6 runs eac
 | With them | ~210% | ~67% | ~29% | ~103 | 8.3 / 16.7 ms |
 
 To compare, or if something regresses, launch with `open --env MACFIX_YIELD=spin <app>` to restore the spinning, or `MACFIX_POINTER_LOCK=every` to forward every update. With the agent server on, `frame_stats` reports frame intervals and CPU per thread group, and `threads` the scheduling state of each thread; `scripts/setup.sh --patch-only --debuggable` lets Instruments attach.
+
+On battery or in Low Power Mode the game runs at 60 FPS, which cut game CPU from ~124% to ~85% on the title screen. `MACFIX_BATTERY_FPS=<n>` sets that rate (`0` keeps 120) and `MACFIX_FPS=<n>` fixes the rate on AC; the agent's `fps` cap overrides both while set.
 
 ## Troubleshooting
 

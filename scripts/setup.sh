@@ -130,7 +130,7 @@ patch_app() {
     xcrun clang -target arm64-apple-ios15.0-macabi \
         -isysroot "$sdk" -iframework "$sdk/System/iOSSupport/System/Library/Frameworks" \
         -dynamiclib -fobjc-arc -framework Foundation -framework GameController -framework QuartzCore \
-        -framework UIKit -framework Metal -framework CoreImage -framework ImageIO -framework CoreGraphics \
+        -framework UIKit -framework Metal -framework CoreImage -framework ImageIO -framework CoreGraphics -framework IOKit \
         -install_name @executable_path/Frameworks/libmacfix.dylib \
         -o "$BUILD/libmacfix.dylib" "$ROOT/macfix/macfix.m" "$ROOT/macfix/agent.m"
     codesign -f -s - "$BUILD/libmacfix.dylib"

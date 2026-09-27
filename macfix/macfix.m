@@ -1,9 +1,12 @@
 // Mac fixes for the iOS Minecraft client under PlayCover.
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #import <netdb.h>
+#import <notify.h>
 #import <mach/mach_time.h>
 #import <pthread.h>
 #import <time.h>
@@ -134,17 +137,81 @@ static void installInputRepair(void) {
 // The game renders from its own display link, created in -startAnimation with
 // the legacy setFrameInterval:, which pins it to 60 Hz on ProMotion displays.
 // Set the range after the game has configured the link; other links (PlayTools
-// uses one to deliver input) are left alone.
+// uses one to deliver input) are left alone. MACFIX_FPS fixes the rate on AC;
+// on battery or in Low Power Mode it is MACFIX_BATTERY_FPS (default 60, 0 = as on AC).
 static IMP origStartAnimation;
-CAFrameRateRange macfixGameFrameRate = {80, 120, 120};  // the agent's fps cap overrides it
+static __weak id gameController;  // main thread only
+static int acFps, batteryFps;  // 0 = 80-120 Hz
+static BOOL onBattery, useUIDevice;
+int macfixFpsCap;  // the agent's fps command; 0 = power-aware rate
+
+void macfixApplyFrameRate(void) {
+    BOOL lowPower = NSProcessInfo.processInfo.lowPowerModeEnabled;
+    int fps = macfixFpsCap ?: ((onBattery || lowPower) && batteryFps ? batteryFps : acFps);
+    CAFrameRateRange range = fps > 0 ? CAFrameRateRangeMake(fps, fps, fps) : CAFrameRateRangeMake(80, 120, 120);
+    CADisplayLink *link = gameController ? ((id (*)(id, SEL))objc_msgSend)(gameController, sel_registerName("displayLink")) : nil;
+    if ([link isKindOfClass:[CADisplayLink class]]) {
+        link.preferredFrameRateRange = range;
+        NSLog(@"[macfix] game display link at %.0f Hz (battery=%d low power=%d cap=%d)", range.preferred, onBattery,
+              lowPower, macfixFpsCap);
+    }
+}
 
 static void startAnimation(id self, SEL _cmd) {
     ((void (*)(id, SEL))origStartAnimation)(self, _cmd);
-    CADisplayLink *link = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("displayLink"));
-    if ([link isKindOfClass:[CADisplayLink class]]) {
-        link.preferredFrameRateRange = macfixGameFrameRate;
-        NSLog(@"[macfix] game display link at %.0f Hz", macfixGameFrameRate.preferred);
+    gameController = self;
+    macfixApplyFrameRate();
+}
+
+// NO when IOKit cannot read the power source (e.g. denied by the sandbox).
+static BOOL readIOKitPowerSource(void) {
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    CFStringRef type = info ? IOPSGetProvidingPowerSourceType(info) : NULL;
+    if (type) {
+        onBattery = CFEqual(type, CFSTR(kIOPSBatteryPowerValue));
     }
+    if (info) {
+        CFRelease(info);
+    }
+    return type != NULL;
+}
+
+static void updatePowerSource(void) {
+    if (useUIDevice) {
+        onBattery = UIDevice.currentDevice.batteryState == UIDeviceBatteryStateUnplugged;
+    } else {
+        readIOKitPowerSource();
+    }
+}
+
+static void powerChanged(void) {
+    updatePowerSource();
+    macfixApplyFrameRate();
+}
+
+static void installPowerAwareRate(void) {
+    const char *ac = getenv("MACFIX_FPS"), *battery = getenv("MACFIX_BATTERY_FPS");
+    acFps = ac ? MAX(atoi(ac), 0) : 0;
+    batteryFps = battery ? MAX(atoi(battery), 0) : 60;
+    useUIDevice = !readIOKitPowerSource();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        if (useUIDevice) {
+            // UIDevice reports unknown until monitoring is on.
+            UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+            updatePowerSource();
+            [nc addObserverForName:UIDeviceBatteryStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                        usingBlock:^(NSNotification *n) { powerChanged(); }];
+        } else {
+            int token;
+            notify_register_dispatch(kIOPSNotifyPowerSource, &token, dispatch_get_main_queue(), ^(int t) { powerChanged(); });
+        }
+        [nc addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *n) { powerChanged(); }];
+        NSLog(@"[macfix] power source via %s: battery=%d, battery rate %d FPS", useUIDevice ? "UIDevice" : "IOKit",
+              onBattery, batteryFps);
+        macfixApplyFrameRate();
+    });
 }
 
 static void installFrameRate(void) {
@@ -157,6 +224,7 @@ static void installFrameRate(void) {
     }
     origStartAnimation = method_setImplementation(m, (IMP)startAnimation);
     NSLog(@"[macfix] frame rate hook installed");
+    installPowerAwareRate();
 }
 
 // The game requests a pointer-lock update on every mouse move, and UIKit
