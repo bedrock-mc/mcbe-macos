@@ -39,7 +39,7 @@ Reinstalling or updating the IPA in PlayCover removes the patch: run `scripts/se
 
 ## AI agents (MCP)
 
-`libmacfix` includes an agent server for [mcpelauncher-agent](https://github.com/bedrock-mc/mcpelauncher-agent), an MCP server that lets an AI agent play the real client: keys, mouse, chat, screenshots, `minecraft://` links, frame-rate cap. It is **headless** by default: the window stays hidden while the game keeps rendering and taking input at 10 FPS, using about a third of one CPU core — roughly 12x less than playing at full frame rate.
+`libmacfix` includes an agent server for [mcpelauncher-agent](https://github.com/bedrock-mc/mcpelauncher-agent), an MCP server that lets an AI agent play the real client: keys, mouse, chat, screenshots, `minecraft://` links, frame-rate cap. It is **headless** by default: the window stays hidden while the game keeps rendering and taking input at 10 FPS, using about a third of one CPU core, against about two cores when playing in a world at 120 FPS.
 
 ```sh
 claude mcp add minecraft -e MCPELAUNCHER_BACKEND=ios -- bun run /path/to/mcpelauncher-agent/src/index.ts
