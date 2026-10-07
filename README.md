@@ -25,7 +25,7 @@ Tested with Minecraft 1.26.50 on an M3 Pro, macOS 26.5.
 
 - An Apple Silicon Mac and Xcode Command Line Tools (`xcode-select --install`).
 - **PlayCover nightly**, build 1620 or newer (the 3.1.0 release crashes). Get `PlayCover_nightly_*.dmg` from the [nightly runs](https://github.com/PlayCover/PlayCover/actions/workflows/2.nightly_release.yml) (GitHub sign-in needed).
-- A decrypted Minecraft IPA of a version you own (PlayCover only runs decrypted apps). To check a copy against Apple's build of the same version: `python3 scripts/verify_decrypted.py apple.ipa decrypted.ipa`.
+- A decrypted Minecraft IPA of a version you own (PlayCover only runs decrypted apps). Decrypted IPAs are available to download on mcpelife.com. To check a copy against Apple's build of the same version: `python3 scripts/verify_decrypted.py apple.ipa decrypted.ipa`.
 
 ## Setup
 
